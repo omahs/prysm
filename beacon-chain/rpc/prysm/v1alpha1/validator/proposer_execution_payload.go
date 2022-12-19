@@ -75,7 +75,7 @@ func (vs *Server) getExecutionPayload(ctx context.Context, slot types.Slot, vIdx
 			if err != nil {
 				return nil, err
 			}
-			warnIfFeeRecipientDiffers(pb, feeRecipient)
+			warnIfFeeRecipientDiffers(pb.FeeRecipient, feeRecipient)
 			return pb, nil
 		case errors.Is(err, context.DeadlineExceeded):
 		default:
@@ -180,18 +180,148 @@ func (vs *Server) getExecutionPayload(ctx context.Context, slot types.Slot, vIdx
 	if err != nil {
 		return nil, err
 	}
-	warnIfFeeRecipientDiffers(pb, feeRecipient)
+	warnIfFeeRecipientDiffers(pb.FeeRecipient, feeRecipient)
+	return pb, nil
+}
+
+// This returns the execution payload of a given slot.
+func (vs *Server) getExecutionPayloadCapella(
+	ctx context.Context,
+	slot types.Slot,
+	vIdx types.ValidatorIndex,
+	headRoot [32]byte,
+) (*enginev1.ExecutionPayloadCapella, error) {
+	proposerID, payloadId, ok := vs.ProposerSlotIndexCache.GetProposerPayloadIDs(slot, headRoot)
+	feeRecipient := params.BeaconConfig().DefaultFeeRecipient
+	recipient, err := vs.BeaconDB.FeeRecipientByValidatorID(ctx, vIdx)
+	switch err == nil {
+	case true:
+		feeRecipient = recipient
+	case errors.As(err, kv.ErrNotFoundFeeRecipient):
+		// If fee recipient is not found in DB and not set from beacon node CLI,
+		// use the burn address.
+		if feeRecipient.String() == params.BeaconConfig().EthBurnAddressHex {
+			logrus.WithFields(logrus.Fields{
+				"validatorIndex": vIdx,
+				"burnAddress":    params.BeaconConfig().EthBurnAddressHex,
+			}).Warn("Fee recipient is currently using the burn address, " +
+				"you will not be rewarded transaction fees on this setting. " +
+				"Please set a different eth address as the fee recipient. " +
+				"Please refer to our documentation for instructions")
+		}
+	default:
+		return nil, errors.Wrap(err, "could not get fee recipient in db")
+	}
+
+	if ok && proposerID == vIdx && payloadId != [8]byte{} { // Payload ID is cache hit. Return the cached payload ID.
+		var pid [8]byte
+		copy(pid[:], payloadId[:])
+		payloadIDCacheHit.Inc()
+		payload, err := vs.ExecutionEngineCaller.GetPayload(ctx, pid, slot)
+		switch {
+		case err == nil:
+			pb, err := payload.PbCapella()
+			if err != nil {
+				return nil, err
+			}
+			warnIfFeeRecipientDiffers(pb.FeeRecipient, feeRecipient)
+			return pb, nil
+		case errors.Is(err, context.DeadlineExceeded):
+		default:
+			return nil, errors.Wrap(err, "could not get cached payload from execution client")
+		}
+	}
+
+	st, err := vs.HeadFetcher.HeadState(ctx)
+	if err != nil {
+		return nil, err
+	}
+	st, err = transition.ProcessSlotsIfPossible(ctx, st, slot)
+	if err != nil {
+		return nil, err
+	}
+
+	var parentHash []byte
+
+	t, err := slots.ToTime(st.GenesisTime(), slot)
+	if err != nil {
+		return nil, err
+	}
+	header, err := st.LatestExecutionPayloadHeader()
+	if err != nil {
+		return nil, err
+	}
+	parentHash = header.BlockHash()
+	payloadIDCacheMiss.Inc()
+
+	random, err := helpers.RandaoMix(st, time.CurrentEpoch(st))
+	if err != nil {
+		return nil, err
+	}
+	finalizedBlockHash := params.BeaconConfig().ZeroHash[:]
+	finalizedRoot := bytesutil.ToBytes32(st.FinalizedCheckpoint().Root)
+	if finalizedRoot != [32]byte{} { // finalized root could be zeros before the first finalized block.
+		finalizedBlock, err := vs.BeaconDB.Block(ctx, bytesutil.ToBytes32(st.FinalizedCheckpoint().Root))
+		if err != nil {
+			return nil, err
+		}
+		if err := consensusblocks.BeaconBlockIsNil(finalizedBlock); err != nil {
+			return nil, err
+		}
+		switch finalizedBlock.Version() {
+		case version.Phase0, version.Altair: // Blocks before Bellatrix don't have execution payloads. Use zeros as the hash.
+		default:
+			finalizedPayload, err := finalizedBlock.Block().Body().Execution()
+			if err != nil {
+				return nil, err
+			}
+			finalizedBlockHash = finalizedPayload.BlockHash()
+		}
+	}
+
+	f := &enginev1.ForkchoiceState{
+		HeadBlockHash:      parentHash,
+		SafeBlockHash:      finalizedBlockHash,
+		FinalizedBlockHash: finalizedBlockHash,
+	}
+
+	p := &enginev1.PayloadAttributes{
+		Timestamp:             uint64(t.Unix()),
+		PrevRandao:            random,
+		SuggestedFeeRecipient: feeRecipient.Bytes(),
+	}
+
+	pa, err := payloadattribute.New(p)
+	if err != nil {
+		return nil, err
+	}
+	payloadID, _, err := vs.ExecutionEngineCaller.ForkchoiceUpdated(ctx, f, pa)
+	if err != nil {
+		return nil, errors.Wrap(err, "could not prepare payload")
+	}
+	if payloadID == nil {
+		return nil, fmt.Errorf("nil payload with block hash: %#x", parentHash)
+	}
+	payload, err := vs.ExecutionEngineCaller.GetPayload(ctx, *payloadID, slot)
+	if err != nil {
+		return nil, err
+	}
+	pb, err := payload.PbCapella()
+	if err != nil {
+		return nil, err
+	}
+	warnIfFeeRecipientDiffers(pb.FeeRecipient, feeRecipient)
 	return pb, nil
 }
 
 // warnIfFeeRecipientDiffers logs a warning if the fee recipient in the included payload does not
 // match the requested one.
-func warnIfFeeRecipientDiffers(payload *enginev1.ExecutionPayload, feeRecipient common.Address) {
+func warnIfFeeRecipientDiffers(payloadFeeRecipient []byte, requestedFeeRecipient common.Address) {
 	// Warn if the fee recipient is not the value we expect.
-	if payload != nil && !bytes.Equal(payload.FeeRecipient, feeRecipient[:]) {
+	if !bytes.Equal(payloadFeeRecipient, requestedFeeRecipient[:]) {
 		logrus.WithFields(logrus.Fields{
-			"wantedFeeRecipient": fmt.Sprintf("%#x", feeRecipient),
-			"received":           fmt.Sprintf("%#x", payload.FeeRecipient),
+			"wantedFeeRecipient": fmt.Sprintf("%#x", requestedFeeRecipient),
+			"received":           fmt.Sprintf("%#x", payloadFeeRecipient),
 		}).Warn("Fee recipient address from execution client is not what was expected. " +
 			"It is possible someone has compromised your client to try and take your transaction fees")
 	}

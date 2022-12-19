@@ -23,6 +23,7 @@ type EngineClient struct {
 	PayloadIDBytes              *pb.PayloadIDBytes
 	ForkChoiceUpdatedResp       []byte
 	ExecutionPayload            *pb.ExecutionPayload
+	ExecutionPayloadCapella     *pb.ExecutionPayloadCapella
 	ExecutionBlock              *pb.ExecutionBlock
 	Err                         error
 	ErrLatestExecBlock          error
@@ -55,10 +56,20 @@ func (e *EngineClient) ForkchoiceUpdated(
 
 // GetPayload --
 func (e *EngineClient) GetPayload(_ context.Context, _ [8]byte, _ types.Slot) (interfaces.ExecutionData, error) {
-	p, err := blocks.WrappedExecutionPayload(e.ExecutionPayload)
+	var p interfaces.ExecutionData
+	var err error
+	if e.ExecutionPayload != nil {
+		p, err = blocks.WrappedExecutionPayload(e.ExecutionPayload)
+		if err != nil {
+			return nil, err
+		}
+		return p, e.ErrGetPayload
+	}
+	p, err = blocks.WrappedExecutionPayloadCapella(e.ExecutionPayloadCapella)
 	if err != nil {
 		return nil, err
 	}
+
 	return p, e.ErrGetPayload
 }
 

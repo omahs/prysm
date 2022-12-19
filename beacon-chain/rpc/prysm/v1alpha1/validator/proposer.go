@@ -53,6 +53,16 @@ func (vs *Server) GetBeaconBlock(ctx context.Context, req *ethpb.BlockRequest) (
 			return nil, status.Errorf(codes.Internal, "Could not fetch Altair beacon block: %v", err)
 		}
 		return &ethpb.GenericBeaconBlock{Block: &ethpb.GenericBeaconBlock_Altair{Altair: blk}}, nil
+	} else if slots.ToEpoch(req.Slot) < params.BeaconConfig().CapellaForkEpoch {
+		// An optimistic validator MUST NOT produce a block (i.e., sign across the DOMAIN_BEACON_PROPOSER domain).
+		if err := vs.optimisticStatus(ctx); err != nil {
+			return nil, err
+		}
+		blk, err := vs.getBellatrixBeaconBlock(ctx, req)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "Could not fetch Bellatrix beacon block: %v", err)
+		}
+		return blk, nil
 	}
 
 	// An optimistic validator MUST NOT produce a block (i.e., sign across the DOMAIN_BEACON_PROPOSER domain).
@@ -60,7 +70,7 @@ func (vs *Server) GetBeaconBlock(ctx context.Context, req *ethpb.BlockRequest) (
 		return nil, err
 	}
 
-	return vs.getBellatrixBeaconBlock(ctx, req)
+	return vs.getCapellaBeaconBlock(ctx, req)
 }
 
 // ProposeBeaconBlock is called by a proposer during its assigned slot to create a block in an attempt
