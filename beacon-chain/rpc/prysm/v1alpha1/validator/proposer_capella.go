@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/prysmaticlabs/prysm/v3/beacon-chain/core/transition/interop"
+	fieldparams "github.com/prysmaticlabs/prysm/v3/config/fieldparams"
 	"github.com/prysmaticlabs/prysm/v3/config/params"
 	consensusblocks "github.com/prysmaticlabs/prysm/v3/consensus-types/blocks"
 	"github.com/prysmaticlabs/prysm/v3/encoding/bytesutil"
@@ -47,7 +48,7 @@ func (vs *Server) getCapellaBeaconBlock(ctx context.Context, req *ethpb.BlockReq
 	}
 	// Compute state root with the newly constructed block.
 	wsb, err := consensusblocks.NewSignedBeaconBlock(
-		&ethpb.SignedBeaconBlockCapella{Block: blk, Signature: make([]byte, 96)},
+		&ethpb.SignedBeaconBlockCapella{Block: blk, Signature: make([]byte, fieldparams.BLSSignatureLength)},
 	)
 	if err != nil {
 		return nil, err

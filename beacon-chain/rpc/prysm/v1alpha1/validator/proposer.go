@@ -35,8 +35,7 @@ var eth1DataNotification bool
 const eth1dataTimeout = 2 * time.Second
 
 // GetBeaconBlock is called by a proposer during its assigned slot to request a block to sign
-// by passing in the slot and the signed randao reveal of the slot. Returns phase0 beacon blocks
-// before the Altair fork epoch and Altair blocks post-fork epoch.
+// by passing in the slot and the signed randao reveal of the slot.
 func (vs *Server) GetBeaconBlock(ctx context.Context, req *ethpb.BlockRequest) (*ethpb.GenericBeaconBlock, error) {
 	ctx, span := trace.StartSpan(ctx, "ProposerServer.GetBeaconBlock")
 	defer span.End()
@@ -53,23 +52,19 @@ func (vs *Server) GetBeaconBlock(ctx context.Context, req *ethpb.BlockRequest) (
 			return nil, status.Errorf(codes.Internal, "Could not fetch Altair beacon block: %v", err)
 		}
 		return &ethpb.GenericBeaconBlock{Block: &ethpb.GenericBeaconBlock_Altair{Altair: blk}}, nil
-	} else if slots.ToEpoch(req.Slot) < params.BeaconConfig().CapellaForkEpoch {
-		// An optimistic validator MUST NOT produce a block (i.e., sign across the DOMAIN_BEACON_PROPOSER domain).
-		if err := vs.optimisticStatus(ctx); err != nil {
-			return nil, err
-		}
-		blk, err := vs.getBellatrixBeaconBlock(ctx, req)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "Could not fetch Bellatrix beacon block: %v", err)
-		}
-		return blk, nil
 	}
 
 	// An optimistic validator MUST NOT produce a block (i.e., sign across the DOMAIN_BEACON_PROPOSER domain).
 	if err := vs.optimisticStatus(ctx); err != nil {
 		return nil, err
 	}
-
+	if slots.ToEpoch(req.Slot) < params.BeaconConfig().CapellaForkEpoch {
+		blk, err := vs.getBellatrixBeaconBlock(ctx, req)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "Could not fetch Bellatrix beacon block: %v", err)
+		}
+		return blk, nil
+	}
 	return vs.getCapellaBeaconBlock(ctx, req)
 }
 

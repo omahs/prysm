@@ -86,6 +86,16 @@ func TestProposer_ProposeBlock_OK(t *testing.T) {
 				return &ethpb.GenericSignedBeaconBlock{Block: blk}
 			},
 		},
+		{
+			name: "capella",
+			block: func(parent [32]byte) *ethpb.GenericSignedBeaconBlock {
+				blockToPropose := util.NewBeaconBlockCapella()
+				blockToPropose.Block.Slot = 5
+				blockToPropose.Block.ParentRoot = parent[:]
+				blk := &ethpb.GenericSignedBeaconBlock_Capella{Capella: blockToPropose}
+				return &ethpb.GenericSignedBeaconBlock{Block: blk}
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -2268,6 +2278,154 @@ func TestProposer_GetBeaconBlock_BellatrixEpoch(t *testing.T) {
 	require.NoError(t, err)
 	require.LogsDoNotContain(t, newHook, "Fee recipient is currently using the burn address")
 }
+
+/*func TestProposer_GetBeaconBlock_CapellaEpoch(t *testing.T) {
+	db := dbutil.SetupDB(t)
+	ctx := context.Background()
+	hook := logTest.NewGlobal()
+
+	terminalBlockHash := bytesutil.PadTo([]byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+		0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, 32)
+	params.SetupTestConfigCleanup(t)
+	cfg := params.BeaconConfig().Copy()
+	cfg.CapellaForkEpoch = 3
+	cfg.BellatrixForkEpoch = 2
+	cfg.AltairForkEpoch = 1
+	cfg.TerminalBlockHash = common.BytesToHash(terminalBlockHash)
+	cfg.TerminalBlockHashActivationEpoch = 2
+	params.OverrideBeaconConfig(cfg)
+	beaconState, privKeys := util.DeterministicGenesisState(t, 64)
+
+	stateRoot, err := beaconState.HashTreeRoot(ctx)
+	require.NoError(t, err, "Could not hash genesis state")
+
+	genesis := b.NewGenesisBlock(stateRoot[:])
+	util.SaveBlock(t, ctx, db, genesis)
+
+	parentRoot, err := genesis.Block.HashTreeRoot()
+	require.NoError(t, err, "Could not get signing root")
+	require.NoError(t, db.SaveState(ctx, beaconState, parentRoot), "Could not save genesis state")
+	require.NoError(t, db.SaveHeadBlockRoot(ctx, parentRoot), "Could not save genesis state")
+
+	capellaSlot, err := slots.EpochStart(params.BeaconConfig().CapellaForkEpoch)
+	require.NoError(t, err)
+
+	var scBits [fieldparams.SyncAggregateSyncCommitteeBytesLength]byte
+	blk := &ethpb.SignedBeaconBlockCapella{
+		Block: &ethpb.BeaconBlockCapella{
+			Slot:       capellaSlot + 1,
+			ParentRoot: parentRoot[:],
+			StateRoot:  genesis.Block.StateRoot,
+			Body: &ethpb.BeaconBlockBodyCapella{
+				RandaoReveal:  genesis.Block.Body.RandaoReveal,
+				Graffiti:      genesis.Block.Body.Graffiti,
+				Eth1Data:      genesis.Block.Body.Eth1Data,
+				SyncAggregate: &ethpb.SyncAggregate{SyncCommitteeBits: scBits[:], SyncCommitteeSignature: make([]byte, 96)},
+				ExecutionPayload: &enginev1.ExecutionPayloadCapella{
+					ParentHash:    make([]byte, fieldparams.RootLength),
+					FeeRecipient:  make([]byte, fieldparams.FeeRecipientLength),
+					StateRoot:     make([]byte, fieldparams.RootLength),
+					ReceiptsRoot:  make([]byte, fieldparams.RootLength),
+					LogsBloom:     make([]byte, fieldparams.LogsBloomLength),
+					PrevRandao:    make([]byte, fieldparams.RootLength),
+					ExtraData:     make([]byte, 32),
+					BaseFeePerGas: make([]byte, 32),
+					BlockHash:     make([]byte, fieldparams.RootLength),
+					Transactions:  make([][]byte, 0),
+					Withdrawals:   make([]*enginev1.Withdrawal, 0),
+				},
+			},
+		},
+		Signature: genesis.Signature,
+	}
+
+	blkRoot, err := blk.Block.HashTreeRoot()
+	require.NoError(t, err)
+	require.NoError(t, err, "Could not get signing root")
+	require.NoError(t, db.SaveState(ctx, beaconState, blkRoot), "Could not save genesis state")
+	require.NoError(t, db.SaveHeadBlockRoot(ctx, blkRoot), "Could not save genesis state")
+
+	c := mockExecution.New()
+	c.HashesByHeight[0] = terminalBlockHash
+	random, err := helpers.RandaoMix(beaconState, slots.ToEpoch(beaconState.Slot()))
+	require.NoError(t, err)
+	timeStamp, err := slots.ToTime(beaconState.GenesisTime(), capellaSlot+1)
+	require.NoError(t, err)
+
+	payload := &enginev1.ExecutionPayloadCapella{
+		ParentHash:    make([]byte, fieldparams.RootLength),
+		FeeRecipient:  make([]byte, fieldparams.FeeRecipientLength),
+		StateRoot:     make([]byte, fieldparams.RootLength),
+		ReceiptsRoot:  make([]byte, fieldparams.RootLength),
+		LogsBloom:     make([]byte, fieldparams.LogsBloomLength),
+		PrevRandao:    random,
+		BaseFeePerGas: make([]byte, fieldparams.RootLength),
+		BlockHash:     make([]byte, fieldparams.RootLength),
+		Transactions:  make([][]byte, 0),
+		ExtraData:     make([]byte, 0),
+		BlockNumber:   1,
+		GasLimit:      2,
+		GasUsed:       3,
+		Timestamp:     uint64(timeStamp.Unix()),
+		Withdrawals:   make([]*enginev1.Withdrawal, 0),
+	}
+	proposerServer := &Server{
+		HeadFetcher:       &mock.ChainService{State: beaconState, Root: parentRoot[:], Optimistic: false},
+		TimeFetcher:       &mock.ChainService{Genesis: time.Now()},
+		SyncChecker:       &mockSync.Sync{IsSyncing: false},
+		BlockReceiver:     &mock.ChainService{},
+		HeadUpdater:       &mock.ChainService{},
+		ChainStartFetcher: &mockExecution.Chain{},
+		Eth1InfoFetcher:   &mockExecution.Chain{},
+		Eth1BlockFetcher:  c,
+		MockEth1Votes:     true,
+		AttPool:           attestations.NewPool(),
+		SlashingsPool:     slashings.NewPool(),
+		ExitPool:          voluntaryexits.NewPool(),
+		StateGen:          stategen.New(db, doublylinkedtree.New()),
+		SyncCommitteePool: synccommittee.NewStore(),
+		ExecutionEngineCaller: &mockExecution.EngineClient{
+			PayloadIDBytes:          &enginev1.PayloadIDBytes{1},
+			ExecutionPayloadCapella: payload,
+		},
+		BeaconDB:               db,
+		ProposerSlotIndexCache: cache.NewProposerPayloadIDsCache(),
+	}
+
+	randaoReveal, err := util.RandaoReveal(beaconState, 0, privKeys)
+	require.NoError(t, err)
+
+	graffiti := bytesutil.ToBytes32([]byte("eth2"))
+	require.NoError(t, err)
+	req := &ethpb.BlockRequest{
+		Slot:         capellaSlot + 1,
+		RandaoReveal: randaoReveal,
+		Graffiti:     graffiti[:],
+	}
+
+	block, err := proposerServer.GetBeaconBlock(ctx, req)
+	require.NoError(t, err)
+	capellaBlk, ok := block.GetBlock().(*ethpb.GenericBeaconBlock_Capella)
+	require.Equal(t, true, ok)
+
+	assert.Equal(t, req.Slot, capellaBlk.Capella.Slot)
+	assert.DeepEqual(t, parentRoot[:], capellaBlk.Capella.ParentRoot, "Expected block to have correct parent root")
+	assert.DeepEqual(t, randaoReveal, capellaBlk.Capella.Body.RandaoReveal, "Expected block to have correct randao reveal")
+	assert.DeepEqual(t, req.Graffiti, capellaBlk.Capella.Body.Graffiti, "Expected block to have correct Graffiti")
+
+	require.LogsContain(t, hook, "Fee recipient is currently using the burn address")
+	require.DeepEqual(t, payload, capellaBlk.Capella.Body.ExecutionPayload) // Payload should equal.
+
+	// Operator sets default fee recipient to not be burned through beacon node cli.
+	newHook := logTest.NewGlobal()
+	params.SetupTestConfigCleanup(t)
+	cfg = params.MinimalSpecConfig().Copy()
+	cfg.DefaultFeeRecipient = common.Address{'b'}
+	params.OverrideBeaconConfig(cfg)
+	_, err = proposerServer.GetBeaconBlock(ctx, req)
+	require.NoError(t, err)
+	require.LogsDoNotContain(t, newHook, "Fee recipient is currently using the burn address")
+}*/
 
 func TestProposer_GetBeaconBlock_Optimistic(t *testing.T) {
 	params.SetupTestConfigCleanup(t)
