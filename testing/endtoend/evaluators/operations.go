@@ -7,8 +7,6 @@ import (
 	"math"
 	"strings"
 
-	log "github.com/sirupsen/logrus"
-
 	"github.com/pkg/errors"
 	corehelpers "github.com/prysmaticlabs/prysm/v3/beacon-chain/core/helpers"
 	"github.com/prysmaticlabs/prysm/v3/beacon-chain/core/signing"
@@ -34,7 +32,7 @@ var churnLimit = 4
 var depositValCount = e2e.DepositCount
 
 // Deposits should be processed in twice the length of the epochs per eth1 voting period.
-var depositsInBlockStart = types.Epoch(math.Floor(float64(params.E2ETestConfig().EpochsPerEth1VotingPeriod) * 2))
+var depositsInBlockStart = params.E2ETestConfig().EpochsPerEth1VotingPeriod * 2
 
 // deposits included + finalization + MaxSeedLookahead for activation.
 var depositActivationStartEpoch = depositsInBlockStart + 2 + params.E2ETestConfig().MaxSeedLookahead
@@ -120,15 +118,7 @@ func processesDepositsInBlocks(ec e2etypes.EvaluationContext, conns ...*grpc.Cli
 			return errors.Wrap(err, "failed to convert api response type to SignedBeaconBlock interface")
 		}
 		b := sb.Block()
-		slot := b.Slot()
-		eth1Data := b.Body().Eth1Data()
 		deposits := b.Body().Deposits()
-		fmt.Printf(
-			"Slot: %d with %d deposits, Eth1 block %#x with %d deposits\n",
-			slot,
-			len(deposits),
-			eth1Data.BlockHash, eth1Data.DepositCount,
-		)
 		for _, d := range deposits {
 			k := bytesutil.ToBytes48(d.Data.PublicKey)
 			v := observed[k]
@@ -155,7 +145,12 @@ func verifyGraffitiInBlocks(_ e2etypes.EvaluationContext, conns ...*grpc.ClientC
 	if err != nil {
 		return errors.Wrap(err, "failed to get chain head")
 	}
-	req := &ethpb.ListBlocksRequest{QueryFilter: &ethpb.ListBlocksRequest_Epoch{Epoch: chainHead.HeadEpoch.Sub(1)}}
+	begin := chainHead.HeadEpoch
+	// Prevent underflow when this runs at epoch 0.
+	if begin > 0 {
+		begin = begin.Sub(1)
+	}
+	req := &ethpb.ListBlocksRequest{QueryFilter: &ethpb.ListBlocksRequest_Epoch{Epoch: begin}}
 	blks, err := client.ListBeaconBlocks(context.Background(), req)
 	if err != nil {
 		return errors.Wrap(err, "failed to get blocks from beacon-chain")
@@ -259,7 +254,6 @@ func getAllValidators(c ethpb.BeaconChainClient) ([]*ethpb.Validator, error) {
 			vals = append(vals, v.Validator)
 		}
 		pageToken = validators.NextPageToken
-		log.WithField("len", len(vals)).WithField("pageToken", pageToken).Info("getAllValidators")
 	}
 	return vals, nil
 }
@@ -393,12 +387,18 @@ func validatorsVoteWithTheMajority(_ e2etypes.EvaluationContext, conns ...*grpc.
 		return errors.Wrap(err, "failed to get chain head")
 	}
 
-	req := &ethpb.ListBlocksRequest{QueryFilter: &ethpb.ListBlocksRequest_Epoch{Epoch: chainHead.HeadEpoch.Sub(1)}}
+	begin := chainHead.HeadEpoch
+	// Prevent underflow when this runs at epoch 0.
+	if begin > 0 {
+		begin = begin.Sub(1)
+	}
+	req := &ethpb.ListBlocksRequest{QueryFilter: &ethpb.ListBlocksRequest_Epoch{Epoch: begin}}
 	blks, err := client.ListBeaconBlocks(context.Background(), req)
 	if err != nil {
 		return errors.Wrap(err, "failed to get blocks from beacon-chain")
 	}
 
+	slotsPerVotingPeriod := params.E2ETestConfig().SlotsPerEpoch.Mul(uint64(params.E2ETestConfig().EpochsPerEth1VotingPeriod))
 	for _, blk := range blks.BlockContainers {
 		var slot types.Slot
 		var vote []byte
@@ -422,7 +422,7 @@ func validatorsVoteWithTheMajority(_ e2etypes.EvaluationContext, conns ...*grpc.
 		default:
 			return errors.New("block neither phase0,altair or bellatrix")
 		}
-		slotsPerVotingPeriod := params.E2ETestConfig().SlotsPerEpoch.Mul(uint64(params.E2ETestConfig().EpochsPerEth1VotingPeriod))
+		seenVotes[slot] = vote
 
 		// We treat epoch 1 differently from other epoch for two reasons:
 		// - this evaluator is not executed for epoch 0 so we have to calculate the first slot differently
@@ -443,6 +443,14 @@ func validatorsVoteWithTheMajority(_ e2etypes.EvaluationContext, conns ...*grpc.
 		}
 
 		if !bytes.Equal(vote, expectedEth1DataVote) {
+			for i := types.Slot(0); i < slot; i++ {
+				v, ok := seenVotes[i]
+				if ok {
+					fmt.Printf("vote at slot=%d = %#x\n", i, v)
+				} else {
+					fmt.Printf("did not see slot=%d\n", i)
+				}
+			}
 			return fmt.Errorf("incorrect eth1data vote for slot %d; expected: %#x vs voted: %#x",
 				slot, expectedEth1DataVote, vote)
 		}
@@ -450,4 +458,5 @@ func validatorsVoteWithTheMajority(_ e2etypes.EvaluationContext, conns ...*grpc.
 	return nil
 }
 
+var seenVotes = make(map[types.Slot][]byte)
 var expectedEth1DataVote []byte

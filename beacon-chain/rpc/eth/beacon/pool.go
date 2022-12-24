@@ -16,6 +16,7 @@ import (
 	ethpbv2 "github.com/prysmaticlabs/prysm/v3/proto/eth/v2"
 	"github.com/prysmaticlabs/prysm/v3/proto/migration"
 	ethpbalpha "github.com/prysmaticlabs/prysm/v3/proto/prysm/v1alpha1"
+	"github.com/prysmaticlabs/prysm/v3/runtime/version"
 	"github.com/prysmaticlabs/prysm/v3/time/slots"
 	"go.opencensus.io/trace"
 	"google.golang.org/grpc/codes"
@@ -306,27 +307,50 @@ func (bs *Server) SubmitVoluntaryExit(ctx context.Context, req *ethpbv1.SignedVo
 	return &emptypb.Empty{}, nil
 }
 
-// SubmitSignedBLSToExecutionChange submits said object to the node's pool
+// SubmitSignedBLSToExecutionChanges submits said object to the node's pool
 // if it passes validation the node must broadcast it to the network.
-func (bs *Server) SubmitSignedBLSToExecutionChange(ctx context.Context, req *ethpbv2.SignedBLSToExecutionChange) (*emptypb.Empty, error) {
+func (bs *Server) SubmitSignedBLSToExecutionChanges(ctx context.Context, req *ethpbv2.SubmitBLSToExecutionChangesRequest) (*emptypb.Empty, error) {
 	ctx, span := trace.StartSpan(ctx, "beacon.SubmitVoluntaryExit")
 	defer span.End()
-	alphaChange := migration.V2SignedBLSToExecutionChangeToV1Alpha1(req)
 	st, err := bs.ChainInfoFetcher.HeadState(ctx)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not get head state: %v", err)
 	}
-	_, err = blocks.ValidateBLSToExecutionChange(st, alphaChange)
+	for _, change := range req.GetChanges() {
+		alphaChange := migration.V2SignedBLSToExecutionChangeToV1Alpha1(change)
+		_, err = blocks.ValidateBLSToExecutionChange(st, alphaChange)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "Could not validate SignedBLSToExecutionChange: %v", err)
+		}
+		if err := blocks.VerifyBLSChangeSignature(st, change); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "Could not validate signature: %v", err)
+		}
+		bs.BLSChangesPool.InsertBLSToExecChange(alphaChange)
+		if st.Version() >= version.Capella {
+			if err := bs.Broadcaster.Broadcast(ctx, alphaChange); err != nil {
+				return nil, status.Errorf(codes.Internal, "Could not broadcast BLSToExecutionChange: %v", err)
+			}
+		}
+	}
+	return &emptypb.Empty{}, nil
+}
+
+// ListBLSToExecutionChanges retrieves BLS to execution changes known by the node but not necessarily incorporated into any block
+func (bs *Server) ListBLSToExecutionChanges(ctx context.Context, _ *emptypb.Empty) (*ethpbv2.BLSToExecutionChangesPoolResponse, error) {
+	ctx, span := trace.StartSpan(ctx, "beacon.ListBLSToExecutionChanges")
+	defer span.End()
+
+	sourceChanges, err := bs.BLSChangesPool.PendingBLSToExecChanges()
 	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "Could not validate SignedBLSToExecutionChange: %v", err)
-	}
-	if err := blocks.VerifyBLSChangeSignature(st, req); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "Could not validate signature: %v", err)
-	}
-	bs.BLSChangesPool.InsertBLSToExecChange(alphaChange)
-	if err := bs.Broadcaster.Broadcast(ctx, alphaChange); err != nil {
-		return nil, status.Errorf(codes.Internal, "Could not broadcast BLSToExecutionChange: %v", err)
+		return nil, status.Errorf(codes.Internal, "Could not get BLS to execution changes: %v", err)
 	}
 
-	return &emptypb.Empty{}, nil
+	changes := make([]*ethpbv2.SignedBLSToExecutionChange, len(sourceChanges))
+	for i, ch := range sourceChanges {
+		changes[i] = migration.V1Alpha1SignedBLSToExecChangeToV2(ch)
+	}
+
+	return &ethpbv2.BLSToExecutionChangesPoolResponse{
+		Data: changes,
+	}, nil
 }

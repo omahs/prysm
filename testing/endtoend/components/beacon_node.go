@@ -13,11 +13,23 @@ import (
 	"syscall"
 
 	"github.com/bazelbuild/rules_go/go/tools/bazel"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/pkg/errors"
+	"github.com/prysmaticlabs/prysm/v3/beacon-chain/state"
+	state_native "github.com/prysmaticlabs/prysm/v3/beacon-chain/state/state-native"
 	cmdshared "github.com/prysmaticlabs/prysm/v3/cmd"
 	"github.com/prysmaticlabs/prysm/v3/cmd/beacon-chain/flags"
+	"github.com/prysmaticlabs/prysm/v3/cmd/beacon-chain/sync/genesis"
 	"github.com/prysmaticlabs/prysm/v3/config/features"
+	fieldparams "github.com/prysmaticlabs/prysm/v3/config/fieldparams"
 	"github.com/prysmaticlabs/prysm/v3/config/params"
+	"github.com/prysmaticlabs/prysm/v3/container/trie"
+	"github.com/prysmaticlabs/prysm/v3/encoding/bytesutil"
+	"github.com/prysmaticlabs/prysm/v3/io/file"
+	enginev1 "github.com/prysmaticlabs/prysm/v3/proto/engine/v1"
+	ethpb "github.com/prysmaticlabs/prysm/v3/proto/prysm/v1alpha1"
+	"github.com/prysmaticlabs/prysm/v3/runtime/interop"
+	"github.com/prysmaticlabs/prysm/v3/runtime/version"
 	"github.com/prysmaticlabs/prysm/v3/testing/endtoend/helpers"
 	e2e "github.com/prysmaticlabs/prysm/v3/testing/endtoend/params"
 	e2etypes "github.com/prysmaticlabs/prysm/v3/testing/endtoend/types"
@@ -166,6 +178,79 @@ func NewBeaconNode(config *e2etypes.E2EConfig, index int, enr string) *BeaconNod
 	}
 }
 
+func (node *BeaconNode) generateGenesis(ctx context.Context) (state.BeaconState, error) {
+	if e2e.TestParams.Eth1GenesisBlock == nil {
+		return nil, errors.New("Cannot construct bellatrix block, e2e.TestParams.Eth1GenesisBlock == nil")
+	}
+	gb := e2e.TestParams.Eth1GenesisBlock
+	// so the DepositRoot in the BeaconState should be set to the HTR of an empty deposit trie.
+	t, err := trie.NewTrie(params.BeaconConfig().DepositContractTreeDepth)
+	if err != nil {
+		return nil, err
+	}
+	dr, err := t.HashTreeRoot()
+	if err != nil {
+		return nil, err
+	}
+	e1d := &ethpb.Eth1Data{
+		DepositRoot:  dr[:],
+		DepositCount: 0,
+		BlockHash:    gb.Hash().Bytes(),
+	}
+	v := e2etypes.GenesisFork()
+	switch v {
+	case version.Bellatrix:
+		return generateGenesisBellatrix(ctx, gb, e1d)
+	case version.Phase0:
+		return generateGenesisPhase0(ctx, e1d)
+	default:
+		return nil, fmt.Errorf("unsupported genesis fork version %s", version.String(v))
+	}
+}
+
+func (node *BeaconNode) saveGenesis(ctx context.Context) (string, error) {
+	// The deposit contract starts with an empty trie, we use the BeaconState to "pre-mine" the validator registry,
+	g, err := node.generateGenesis(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	root, err := g.HashTreeRoot(ctx)
+	if err != nil {
+		return "", err
+	}
+	lbhr, err := g.LatestBlockHeader().HashTreeRoot()
+	if err != nil {
+		return "", err
+	}
+	log.WithField("fork_version", g.Fork().CurrentVersion).
+		WithField("latest_block_header.root", fmt.Sprintf("%#x", lbhr)).
+		WithField("state_root", fmt.Sprintf("%#x", root)).
+		Infof("BeaconState info")
+
+	genesisBytes, err := g.MarshalSSZ()
+	if err != nil {
+		return "", err
+	}
+	genesisDir := path.Join(e2e.TestParams.TestPath, fmt.Sprintf("genesis/%d", node.index))
+	if err := file.MkdirAll(genesisDir); err != nil {
+		return "", err
+	}
+	genesisPath := path.Join(genesisDir, "genesis.ssz")
+	return genesisPath, file.WriteFile(genesisPath, genesisBytes)
+}
+
+func (node *BeaconNode) saveConfig() (string, error) {
+	cfg := params.BeaconConfig().Copy()
+	cfgBytes := params.ConfigToYaml(cfg)
+	cfgDir := path.Join(e2e.TestParams.TestPath, fmt.Sprintf("config/%d", node.index))
+	if err := file.MkdirAll(cfgDir); err != nil {
+		return "", err
+	}
+	cfgPath := path.Join(cfgDir, "beacon-config.yaml")
+	return cfgPath, file.WriteFile(cfgPath, cfgBytes)
+}
+
 // Start starts a fresh beacon node, connecting to all passed in beacon nodes.
 func (node *BeaconNode) Start(ctx context.Context) error {
 	binaryPath, found := bazel.FindBinary("cmd/beacon-chain", "beacon-chain")
@@ -191,10 +276,20 @@ func (node *BeaconNode) Start(ctx context.Context) error {
 		jwtPath = path.Join(e2e.TestParams.TestPath, "eth1data/miner/")
 	}
 	jwtPath = path.Join(jwtPath, "geth/jwtsecret")
+
+	genesisPath, err := node.saveGenesis(ctx)
+	if err != nil {
+		return err
+	}
+	cfgPath, err := node.saveConfig()
+	if err != nil {
+		return err
+	}
 	args := []string{
+		fmt.Sprintf("--%s=%s", genesis.StatePath.Name, genesisPath),
 		fmt.Sprintf("--%s=%s/eth2-beacon-node-%d", cmdshared.DataDirFlag.Name, e2e.TestParams.TestPath, index),
 		fmt.Sprintf("--%s=%s", cmdshared.LogFileName.Name, stdOutFile.Name()),
-		fmt.Sprintf("--%s=%s", flags.DepositContractFlag.Name, e2e.TestParams.ContractAddress.Hex()),
+		fmt.Sprintf("--%s=%s", flags.DepositContractFlag.Name, params.BeaconConfig().DepositContractAddress),
 		fmt.Sprintf("--%s=%d", flags.RPCPort.Name, e2e.TestParams.Ports.PrysmBeaconNodeRPCPort+index),
 		fmt.Sprintf("--%s=http://127.0.0.1:%d", flags.ExecutionEngineEndpoint.Name, e2e.TestParams.Ports.Eth1ProxyPort+index),
 		fmt.Sprintf("--%s=%s", flags.ExecutionJWTSecretFlag.Name, jwtPath),
@@ -210,8 +305,8 @@ func (node *BeaconNode) Start(ctx context.Context) error {
 		fmt.Sprintf("--%s=%s", cmdshared.BootstrapNode.Name, enr),
 		fmt.Sprintf("--%s=%s", cmdshared.VerbosityFlag.Name, "debug"),
 		fmt.Sprintf("--%s=%d", flags.BlockBatchLimitBurstFactor.Name, 8),
+		fmt.Sprintf("--%s=%s", cmdshared.ChainConfigFileFlag.Name, cfgPath),
 		"--" + cmdshared.ForceClearDB.Name,
-		"--" + cmdshared.E2EConfigFlag.Name,
 		"--" + cmdshared.AcceptTosFlag.Name,
 		"--" + flags.EnableDebugRPCEndpoints.Name,
 	}
@@ -293,4 +388,36 @@ func (node *BeaconNode) Stop() error {
 
 func (node *BeaconNode) UnderlyingProcess() *os.Process {
 	return node.cmd.Process
+}
+
+func generateGenesisPhase0(ctx context.Context, e1d *ethpb.Eth1Data) (state.BeaconState, error) {
+	g, _, err := interop.GeneratePreminedGenesisState(ctx, e2e.TestParams.CLGenesisTime, params.BeaconConfig().MinGenesisActiveValidatorCount, e1d)
+	if err != nil {
+		return nil, err
+	}
+	return state_native.InitializeFromProtoUnsafePhase0(g)
+}
+
+func generateGenesisBellatrix(ctx context.Context, gb *types.Block, e1d *ethpb.Eth1Data) (state.BeaconState, error) {
+	payload := &enginev1.ExecutionPayload{
+		ParentHash:    gb.ParentHash().Bytes(),
+		FeeRecipient:  gb.Coinbase().Bytes(),
+		StateRoot:     gb.Root().Bytes(),
+		ReceiptsRoot:  gb.ReceiptHash().Bytes(),
+		LogsBloom:     gb.Bloom().Bytes(),
+		PrevRandao:    params.BeaconConfig().ZeroHash[:],
+		BlockNumber:   gb.NumberU64(),
+		GasLimit:      gb.GasLimit(),
+		GasUsed:       gb.GasUsed(),
+		Timestamp:     gb.Time(),
+		ExtraData:     gb.Extra()[:32],
+		BaseFeePerGas: bytesutil.PadTo(bytesutil.ReverseByteOrder(gb.BaseFee().Bytes()), fieldparams.RootLength),
+		BlockHash:     gb.Hash().Bytes(),
+		Transactions:  make([][]byte, 0),
+	}
+	g, _, err := interop.GenerateGenesisStateBellatrix(ctx, e2e.TestParams.CLGenesisTime, params.BeaconConfig().MinGenesisActiveValidatorCount, payload, e1d)
+	if err != nil {
+		return nil, err
+	}
+	return state_native.InitializeFromProtoUnsafeBellatrix(g)
 }
