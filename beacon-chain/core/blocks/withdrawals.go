@@ -2,6 +2,7 @@ package blocks
 
 import (
 	"bytes"
+	"fmt"
 
 	"github.com/pkg/errors"
 	"github.com/prysmaticlabs/prysm/v3/beacon-chain/core/helpers"
@@ -30,6 +31,7 @@ func ProcessBLSToExecutionChanges(
 	st state.BeaconState,
 	signed interfaces.SignedBeaconBlock) (state.BeaconState, error) {
 	if signed.Version() == version.EIP4844 {
+		fmt.Println("Returning early from ProcessBLSToExecutionChanges", st.Version())
 		return st, nil
 	}
 	if signed.Version() < version.Capella {
@@ -120,6 +122,7 @@ func ValidateBLSToExecutionChange(st state.ReadOnlyBeaconState, signed *ethpb.Si
 
 func ProcessWithdrawals(st state.BeaconState, withdrawals []*enginev1.Withdrawal) (state.BeaconState, error) {
 	if st.Version() == version.EIP4844 {
+		fmt.Println("Returning early process_withdrawals", st.Version())
 		return st, nil
 	}
 	expected, err := st.ExpectedWithdrawals()

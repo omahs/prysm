@@ -43,6 +43,9 @@ func (b *BeaconState) NextWithdrawalValidatorIndex() (types.ValidatorIndex, erro
 // applied to the current state. It is also used by validators to check that the execution payload carried
 // the right number of withdrawals
 func (b *BeaconState) ExpectedWithdrawals() ([]*enginev1.Withdrawal, error) {
+	if b.version == version.EIP4844 {
+		return []*enginev1.Withdrawal{}, nil
+	}
 	if b.version < version.Capella {
 		return nil, errNotSupported("ExpectedWithdrawals", b.version)
 	}

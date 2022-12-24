@@ -425,6 +425,8 @@ message BeaconBlockContainer {
         SignedBlindedBeaconBlockCapella blinded_capella_block = 8;
 
         SignedBeaconBlock4844 eip4844 = 9;
+
+        SignedBlindedBeaconBlock4844 blinded_eip4844 = 10;
     }
 }
 
